@@ -137,11 +137,19 @@ typedef struct MOVIndexRange {
     int64_t end;
 } MOVIndexRange;
 
+typedef struct MOVIndexEntry {
+#define MOVINDEX_DISPOSABLE 0x01
+    int8_t  flags;
+} MOVIndexEntry;
+
 typedef struct MOVStreamContext {
     AVIOContext *pb;
     int pb_is_copied;
     int ffindex;          ///< AVStream index
     int next_chunk;
+    MOVIndexEntry * mov_index_entries;
+    int nb_mov_index_entries;
+    unsigned int mov_index_allocated_size;
     unsigned int chunk_count;
     int64_t *chunk_offsets;
     unsigned int stts_count;
@@ -166,6 +174,8 @@ typedef struct MOVStreamContext {
     int keyframe_absent;
     unsigned int keyframe_count;
     int *keyframes;
+    unsigned int frame_deps_count;
+    int *frame_deps;
     int time_scale;
     int64_t time_offset;  ///< time offset of the edit list entries
     int current_sample;

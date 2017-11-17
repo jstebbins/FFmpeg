@@ -2680,6 +2680,43 @@ static int mov_read_stps(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+static int mov_read_sdtp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    AVStream *st;
+    MOVStreamContext *sc;
+    unsigned int i, entries;
+
+    if (c->fc->nb_streams < 1)
+        return 0;
+    st = c->fc->streams[c->fc->nb_streams-1];
+    sc = st->priv_data;
+
+    if (atom.size < 8)
+        return 0;
+
+    avio_r8(pb); /* version */
+    avio_rb24(pb); /* flags */
+
+    entries = atom.size - 4;
+    sc->frame_deps_count = 0;
+    sc->frame_deps = av_malloc_array(entries, sizeof(*sc->frame_deps));
+
+    if (!sc->frame_deps)
+        return AVERROR(ENOMEM);
+
+    for (i = 0; i < entries && !pb->eof_reached; i++) {
+        sc->frame_deps[i] = avio_r8(pb);
+    }
+
+    sc->frame_deps_count = i;
+
+    if (pb->eof_reached)
+        return AVERROR_EOF;
+
+
+    return 0;
+}
+
 static int mov_read_stss(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 {
     AVStream *st;
@@ -3635,15 +3672,40 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
 
         if (!sc->sample_count || st->nb_index_entries)
             return;
-        if (sc->sample_count >= UINT_MAX / sizeof(*st->index_entries) - st->nb_index_entries)
+        if (sc->sample_count >= UINT_MAX / sizeof(*st->index_entries))
             return;
-        if (av_reallocp_array(&st->index_entries,
-                              st->nb_index_entries + sc->sample_count,
+        if (av_reallocp_array(&st->index_entries, sc->sample_count,
                               sizeof(*st->index_entries)) < 0) {
             st->nb_index_entries = 0;
             return;
         }
-        st->index_entries_allocated_size = (st->nb_index_entries + sc->sample_count) * sizeof(*st->index_entries);
+        st->index_entries_allocated_size = sc->sample_count *
+                                           sizeof(*st->index_entries);
+
+        // realloc mov_index_entries if needed for frame dependencies
+        // or if it already exists for ctts
+        if (sc->frame_deps || sc->mov_index_entries) {
+            // make mov_index_entries the same number of entries as
+            // index_entries
+            if (av_reallocp_array(&sc->mov_index_entries,
+                                  sc->sample_count,
+                                  sizeof(*sc->mov_index_entries)) < 0) {
+                sc->nb_mov_index_entries = 0;
+                return;
+            }
+            sc->mov_index_allocated_size = sc->sample_count *
+                                           sizeof(*sc->mov_index_entries);
+
+            if (sc->sample_count > sc->nb_mov_index_entries)
+                // In case there were samples without ctts entries, ensure they
+                // get zero valued entries. This ensures clips which mix boxes
+                // with and without ctts entries don't pickup uninitialized
+                // data.
+                memset(sc->mov_index_entries + sc->nb_mov_index_entries, 0,
+                       (sc->sample_count - sc->nb_mov_index_entries) *
+                       sizeof(*sc->mov_index_entries));
+            sc->nb_mov_index_entries = sc->sample_count;
+        }
 
         for (i = 0; i < sc->chunk_count; i++) {
             int64_t next_offset = i+1 < sc->chunk_count ? sc->chunk_offsets[i+1] : INT64_MAX;
@@ -3664,10 +3726,14 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
 
             for (j = 0; j < sc->stsc_data[stsc_index].count; j++) {
                 int keyframe = 0;
+                int disposable = 0;
                 if (current_sample >= sc->sample_count) {
                     av_log(mov->fc, AV_LOG_ERROR, "wrong sample count\n");
                     return;
                 }
+                if (sc->frame_deps && current_sample < sc->frame_deps_count)
+                    disposable = ((sc->frame_deps[current_sample] >> 2) & 3) ==
+                                 MOV_SAMPLE_DEPENDENCY_NO;
 
                 if (!sc->keyframe_absent && (!sc->keyframe_count || current_sample+key_off == sc->keyframes[stss_index])) {
                     keyframe = 1;
@@ -3697,16 +3763,22 @@ static void mov_build_index(MOVContext *mov, AVStream *st)
                 if (sc->pseudo_stream_id == -1 ||
                    sc->stsc_data[stsc_index].id - 1 == sc->pseudo_stream_id) {
                     AVIndexEntry *e;
+                    MOVIndexEntry *me;
                     if (sample_size > 0x3FFFFFFF) {
                         av_log(mov->fc, AV_LOG_ERROR, "Sample size %u is too large\n", sample_size);
                         return;
                     }
-                    e = &st->index_entries[st->nb_index_entries++];
+                    e = &st->index_entries[st->nb_index_entries];
                     e->pos = current_offset;
                     e->timestamp = current_dts;
                     e->size = sample_size;
                     e->min_distance = distance;
                     e->flags = keyframe ? AVINDEX_KEYFRAME : 0;
+                    if (sc->mov_index_entries) {
+                        me = &sc->mov_index_entries[st->nb_index_entries];
+                        me->flags = disposable ? MOVINDEX_DISPOSABLE : 0;
+                    }
+                    st->nb_index_entries++;
                     av_log(mov->fc, AV_LOG_TRACE, "AVIndex stream %d, sample %u, offset %"PRIx64", dts %"PRId64", "
                             "size %u, distance %u, keyframe %d\n", st->index, current_sample,
                             current_offset, current_dts, sample_size, distance, keyframe);
@@ -4073,6 +4145,7 @@ static int mov_read_trak(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     av_freep(&sc->chunk_offsets);
     av_freep(&sc->sample_sizes);
     av_freep(&sc->keyframes);
+    av_freep(&sc->frame_deps);
     av_freep(&sc->stts_data);
     av_freep(&sc->stps_data);
     av_freep(&sc->elst_data);
@@ -5878,6 +5951,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('s','t','s','c'), mov_read_stsc },
 { MKTAG('s','t','s','d'), mov_read_stsd }, /* sample description */
 { MKTAG('s','t','s','s'), mov_read_stss }, /* sync sample */
+{ MKTAG('s','d','t','p'), mov_read_sdtp }, /* sample dependencies */
 { MKTAG('s','t','s','z'), mov_read_stsz }, /* sample size */
 { MKTAG('s','t','t','s'), mov_read_stts },
 { MKTAG('s','t','z','2'), mov_read_stsz }, /* compact sample size */
@@ -6308,6 +6382,7 @@ static int mov_read_close(AVFormatContext *s)
             continue;
 
         av_freep(&sc->ctts_data);
+        av_freep(&sc->mov_index_entries);
         for (j = 0; j < sc->drefs_count; j++) {
             av_freep(&sc->drefs[j].path);
             av_freep(&sc->drefs[j].dir);
@@ -6324,6 +6399,7 @@ static int mov_read_close(AVFormatContext *s)
         av_freep(&sc->stsc_data);
         av_freep(&sc->sample_sizes);
         av_freep(&sc->keyframes);
+        av_freep(&sc->frame_deps);
         av_freep(&sc->stts_data);
         av_freep(&sc->stps_data);
         av_freep(&sc->elst_data);
@@ -6810,6 +6886,7 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
     MOVContext *mov = s->priv_data;
     MOVStreamContext *sc;
     AVIndexEntry *sample;
+    MOVIndexEntry *movsample = NULL;
     AVStream *st = NULL;
     int64_t current_index;
     int ret;
@@ -6824,6 +6901,8 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
         goto retry;
     }
     sc = st->priv_data;
+    if (sc->current_sample < sc->nb_mov_index_entries)
+        movsample = &sc->mov_index_entries[sc->current_sample];
     /* must be done just before reading, to avoid infinite loop on sample */
     current_index = sc->current_index;
     mov_current_sample_inc(sc);
@@ -6906,6 +6985,9 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (st->discard == AVDISCARD_ALL)
         goto retry;
     pkt->flags |= sample->flags & AVINDEX_KEYFRAME ? AV_PKT_FLAG_KEY : 0;
+    if (movsample)
+        pkt->flags |= movsample->flags & MOVINDEX_DISPOSABLE ?
+                                         AV_PKT_FLAG_DISPOSABLE : 0;
     pkt->pos = sample->pos;
 
     /* Multiple stsd handling. */
