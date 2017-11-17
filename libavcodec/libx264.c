@@ -116,6 +116,7 @@ static int encode_nals(AVCodecContext *ctx, AVPacket *pkt,
     X264Context *x4 = ctx->priv_data;
     uint8_t *p;
     int i, size = x4->sei_size, ret;
+    int disposable;
 
     if (!nnal)
         return 0;
@@ -140,10 +141,14 @@ static int encode_nals(AVCodecContext *ctx, AVPacket *pkt,
         av_freep(&x4->sei);
     }
 
+    disposable = AV_PKT_FLAG_DISPOSABLE;
     for (i = 0; i < nnal; i++){
         memcpy(p, nals[i].p_payload, nals[i].i_payload);
         p += nals[i].i_payload;
+        if (nals[i].i_ref_idc != NAL_PRIORITY_DISPOSABLE)
+            disposable = 0;
     }
+    pkt->flags |= disposable;
 
     return 1;
 }
