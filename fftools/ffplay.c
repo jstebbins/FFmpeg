@@ -198,6 +198,7 @@ typedef struct Decoder {
     int64_t next_pts;
     AVRational next_pts_tb;
     SDL_Thread *decoder_tid;
+    int drop_disposable;
 } Decoder;
 
 typedef struct VideoState {
@@ -660,10 +661,14 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                     ret = got_frame ? 0 : (pkt.data ? AVERROR(EAGAIN) : AVERROR_EOF);
                 }
             } else {
-                if (avcodec_send_packet(d->avctx, &pkt) == AVERROR(EAGAIN)) {
-                    av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
-                    d->packet_pending = 1;
-                    av_packet_move_ref(&d->pkt, &pkt);
+                if (!(d->avctx->codec_type == AVMEDIA_TYPE_VIDEO &&
+                    d->drop_disposable &&
+                    pkt.flags & AV_PKT_FLAG_DISPOSABLE)) {
+                    if (avcodec_send_packet(d->avctx, &pkt) == AVERROR(EAGAIN)) {
+                        av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
+                        d->packet_pending = 1;
+                        av_packet_move_ref(&d->pkt, &pkt);
+                    }
                 }
             }
             av_packet_unref(&pkt);
@@ -1619,9 +1624,11 @@ retry:
                 duration = vp_duration(is, vp, nextvp);
                 if(!is->step && (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration){
                     is->frame_drops_late++;
+                    is->viddec.drop_disposable = 1;
                     frame_queue_next(&is->pictq);
                     goto retry;
                 }
+                is->viddec.drop_disposable = 0;
             }
 
             if (is->subtitle_st) {
