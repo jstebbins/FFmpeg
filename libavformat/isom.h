@@ -138,6 +138,7 @@ typedef struct MOVIndexRange {
 } MOVIndexRange;
 
 typedef struct MOVIndexEntry {
+    int ctts;
 #define MOVINDEX_DISPOSABLE 0x01
     int8_t  flags;
 } MOVIndexEntry;
